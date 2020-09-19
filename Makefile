@@ -3,7 +3,7 @@
 # Plugin name
 NAME=SeaTraffic
 # Version number
-PLUGINVERSION=2.0
+PLUGINVERSION=2.3
 # Build target
 TARGET=lin.xpl
 # Build directory

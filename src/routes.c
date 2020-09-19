@@ -100,11 +100,11 @@ int readroutes(char *mypath, char *err)
                 sprintf(err, "Unrecognised ship type \"%s\" at routes.txt line %d", c, lineno);
                 return 0;
             }
-#if defined(DO_LOCAL_MAP) || defined(DO_ACTIVE_LIST)
+            // nst0022 2.1 activated begin
             c=name+strlen(name)-1;				/* name is utf-8 encoded, which X-Plane can render */
             while ((c>=name) && isspace(*c)) { *(c--)=0; };	/* rtrim */
             currentroute->name=strdup(name);
-#endif
+            // nst0022 2.1 activated end
         }
         c=fgets(buffer, PATH_MAX, h);
     }
@@ -199,7 +199,10 @@ route_t *route_list_pop(route_list_t **route_list, int n)
     this=*lastptr;
     route=this->route;
     *lastptr=this->next;
-    free(this);
+    if (this) // nst0022 2.1
+    {
+      free(this);
+    }
     return route;
 }
 
@@ -223,7 +226,10 @@ void route_list_free(route_list_t **route_list)
     while (*route_list)
     {
         next=(*route_list)->next;
-        free(*route_list);
+        if (* route_list) // nst0022 2.1
+        {
+          free(* route_list);
+        }
         *route_list=next;
     }
 }
@@ -272,7 +278,10 @@ void active_route_pop(active_route_t **active_routes, int n)
     }
     this=*lastptr;
     *lastptr=this->next;
-    free(this);
+    if (this) // nst0022 2.1
+    {
+      free(this);
+    }
 }
 
 
@@ -287,29 +296,29 @@ int active_route_length(active_route_t *active_routes)
     return i;
 }
 
-
-/* Callback for active_route_sort */
-static int sortactive(const void *a, const void *b)
-{
-    const active_route_t *const *ra = a, *const *rb = b;
-    return strcmp((*ra)->object_name, (*rb)->object_name);
-}
-
-
-/* Sort active routes by object name to minimise texture swaps when drawing.
- * Rather than actually shuffling the routes around in memory we just sort an array of pointers and then go back
- * and fix up the linked list. */
-void active_route_sort(active_route_t **active_routes, int active_n)
-{
-    int i;
-    active_route_t *table[ACTIVE_MAX], *active_route;
-
-    if (active_n <= 2) return;		/* Nothing useful to do */
-
-    for (i = 0, active_route = *active_routes; active_route; active_route = active_route->next)
-        table[i++] = active_route;
-    qsort(table, active_n, sizeof(active_route), sortactive);
-    *active_routes = table[0];
-    for (i = 0; i < active_n; i++)
-        table[i]->next = i < active_n-1 ? table[i+1] : NULL;
-}
+// nst0022 2.3
+///* Callback for active_route_sort */
+//static int sortactive(const void *a, const void *b)
+//{
+//    const active_route_t *const *ra = a, *const *rb = b;
+//    return strcmp((*ra)->object_name, (*rb)->object_name);
+//}
+//
+//
+///* Sort active routes by object name to minimise texture swaps when drawing.
+// * Rather than actually shuffling the routes around in memory we just sort an array of pointers and then go back
+// * and fix up the linked list. */
+//void active_route_sort(active_route_t **active_routes, int active_n)
+//{
+//    int i;
+//    active_route_t *table[ACTIVE_MAX], *active_route;
+//
+//    if (active_n <= 2) return;		/* Nothing useful to do */
+//
+//    for (i = 0, active_route = *active_routes; active_route; active_route = active_route->next)
+//        table[i++] = active_route;
+//    qsort(table, active_n, sizeof(active_route), sortactive);
+//    *active_routes = table[0];  // nst0022 this does not look good, table is defined on the stack, but passed to the caller
+//    for (i = 0; i < active_n; i++)
+//        table[i]->next = i < active_n-1 ? table[i+1] : NULL;
+//}

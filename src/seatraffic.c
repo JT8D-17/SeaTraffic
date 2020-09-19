@@ -6,7 +6,6 @@
  */
 
 #include "seatraffic.h"
-#include "wakes.h"
 
 #if IBM
 #  include <windows.h>
@@ -17,8 +16,36 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD ul_reason, LPVOID lpReserved)
 #  include <CoreFoundation/CFURL.h>
 #endif
 
+// globals nst0022 2.1
+
+XPLMMapLayerID g_layer = NULL;
+
+#define MAX_COORDS (360 * 180)
+
+float   s_cached_x_coords  [MAX_COORDS];      // the map x coordinates, at which we will draw our icons
+float   s_cached_y_coords  [MAX_COORDS];      // the map y coordinates, at which we will draw our icons
+float   s_cached_lon_coords[MAX_COORDS];      // the real latitudes, that correspond to our cached map (x, y) coordinates
+float   s_cached_lat_coords[MAX_COORDS];      // the real latitudes, that correspond to our cached map (x, y) coordinates
+float   s_icon_width                    = 0;  // the width, in map units, that we should draw our icons
+int     s_num_cached_coords             = 0;
+
+static XPLMMenuCheck check1;
+static XPLMMenuCheck check2;
+static XPLMMenuCheck check3;
+static XPLMMenuCheck check1_old;
+static XPLMMenuCheck check2_old;
+static XPLMMenuCheck check3_old;
 
 /* Globals */
+
+typedef enum // nst0022 2.1
+{
+  menu_index_item1,
+  menu_index_item2,
+  menu_index_item3
+}
+  menu_index_t;
+
 static char mypath[PATH_MAX], *relpath;
 
 const char * drefs[] = {NULL}; // nst0022
@@ -41,19 +68,16 @@ const ship_t ships[ship_kind_count] =
 
 
 static XPLMDataRef ref_view_x, ref_view_y, ref_view_z, ref_view_h;
-static XPLMDataRef ref_plane_lat, ref_plane_lon, ref_night, ref_monotonic, ref_renopt=0, ref_rentype;
-static XPLMObjectRef wake_big_ref, wake_med_ref, wake_sml_ref;
-static float last_frame=0;		/* last time we recalculated */
+//static XPLMDataRef ref_plane_lat, ref_plane_lon, ref_night, ref_monotonic, ref_renopt=0, ref_rentype;  // nst0022 2.3
+  static XPLMDataRef ref_plane_lat, ref_plane_lon, ref_night, ref_monotonic,               ref_rentype;  // nst0022 2.3
+static XPLMObjectRef wake_ref_big, wake_ref_med, wake_ref_sml;
+//static float last_frame=0;		/* last time we recalculated */
 static int done_init=0, need_recalc=1;
 static tile_t current_tile={0,0};
 static int active_n=0;
 static int active_max = ACTIVE_DEFAULT;
 static active_route_t *active_routes = NULL;
-//static XPLMMenuID my_menu_id; // nst0022
-//static int do_wakes=0;        // nst0022
-//#ifdef DO_LOCAL_MAP           // nst0022
-//static int do_local_map=0;
-//#endif
+static XPLMMenuID my_menu_id; // nst0022 2.1
 #ifdef DO_ACTIVE_LIST
 static XPLMWindowID windowId = NULL;
 static int drawtime, drawmax;		/* clock time taken in last main loop [us] */
@@ -62,6 +86,47 @@ static __int64 ticks_per_sec;
 # endif
 #endif
 
+// prototypes nst0022 2.1
+
+static void toggle_menu_item(   menu_index_t          menu_index_itemx,
+                                XPLMMenuCheck       * check);
+static void get_prefs();
+static void put_prefs();
+
+void create_our_map_layer(      const char          * mapIdentifier,
+                                void                * refcon);
+
+static void prep_cache(         XPLMMapLayerID        layerID,
+                                const float         * inTotalMapBoundsLeftTopRightBottom,
+                                XPLMMapProjectionID   projectionID,
+                                void                * inRefcon);
+
+static void draw_markings(      XPLMMapLayerID        layerID,
+                                const float         * inMapBoundsLeftTopRightBottom,
+                                float                 zoomRatio,
+                                float                 mapUnitsPerUserInterfaceUnit,
+                                XPLMMapStyle          mapStyle,
+                                XPLMMapProjectionID   projectionID,
+                                void                * inRefcon);
+
+static void draw_marking_icons( XPLMMapLayerID        layerID,
+                                const float         * inMapBoundsLeftTopRightBottom,
+                                float                 zoomRatio,
+                                float                 mapUnitsPerUserInterfaceUnit,
+                                XPLMMapStyle          mapStyle,
+                                XPLMMapProjectionID   projectionID,
+                                void                * inRefcon);
+
+static void draw_marking_labels(XPLMMapLayerID        layerID,
+                                const float         * inMapBoundsLeftTopRightBottom,
+                                float                 zoomRatio,
+                                float                 mapUnitsPerUserInterfaceUnit,
+                                XPLMMapStyle          mapStyle,
+                                XPLMMapProjectionID   projectionID,
+                                void                * inRefcon);
+
+static void will_be_deleted(    XPLMMapLayerID        layerID,
+                                void                * inRefcon);
 
 static inline int inrange(tile_t tile, loc_t loc)
 {
@@ -74,10 +139,10 @@ static inline int indrawrange(float xdist, float ydist)
     return (xdist*xdist + ydist*ydist <= DRAW_DISTANCE*DRAW_DISTANCE);
 }
 
-static inline int inreflectrange(float xdist, float ydist)
-{
-    return (xdist*xdist + ydist*ydist <= DRAW_REFLECT*DRAW_REFLECT);
-}
+//static inline int inreflectrange(float xdist, float ydist)
+//{
+//    return (xdist*xdist + ydist*ydist <= DRAW_REFLECT*DRAW_REFLECT);
+//}
 
 static inline int inwakerange(float xdist, float ydist)
 {
@@ -286,9 +351,19 @@ static void recalc(void)
             a->new_node=1;		/* Tell drawships() to calculate state */
             a->next_time = a->last_time + distanceto(newroute->path[a->last_node], newroute->path[a->last_node+a->direction]) / a->ship->speed;
 
-            a->instance_ref = XPLMCreateInstance(* a->object_ref, drefs); // nst0022
+            a->instance_ref_ship = XPLMCreateInstance(* a->object_ref, drefs); // nst0022
+
+            // nst0022 2.2 begin
+            XPLMObjectRef wake_ref_tmp;
+
+            if      (a->ship->semilen >= WAKE_BIG) {wake_ref_tmp = wake_ref_big;}
+            else if (a->ship->semilen >= WAKE_MED) {wake_ref_tmp = wake_ref_med;}
+            else                                   {wake_ref_tmp = wake_ref_sml;}
+
+            a->instance_ref_wake = XPLMCreateInstance(wake_ref_tmp, drefs);
+            // nst0022 2.2 end
         }
-        active_route_sort(&active_routes, active_n);	/* Sort active routes by object name for more efficient drawing */
+        //active_route_sort(&active_routes, active_n); // Sort active routes by object name for more efficient drawing // nst0022 2.3
     }
     route_list_free(&candidates);
 }
@@ -352,6 +427,12 @@ static int drawupdate(void)
             else if (!inrange(current_tile, a->route->path[a->last_node]))
             {
                 /* No longer in range - kill it off on next callback */
+
+                // nst0022 2.2 begin
+                XPLMDestroyInstance(a->instance_ref_ship);
+                XPLMDestroyInstance(a->instance_ref_wake);
+                // nst0022 2.2 end
+
                 need_recalc=1;
                 a=a->next;
                 active_i++;
@@ -441,12 +522,11 @@ float	drawships(float  in_elapsed_since_last_call,                // nst0022
                 float  in_elapsed_time_since_last_flight_loop,
                 int    in_counter,
                 void * in_refcon)
-//static int drawships(XPLMDrawingPhase inPhase, int inIsBefore, void *inRefcon)
 {
     float dummy = 0.0f; // nst0022
     active_route_t *a;
 //    int is_night;     // nst0022 not used anymore
-    float now;
+//  float now;          // nst0022
     float view_x, view_z;
 //  int render_pass;    // nst0022
 #ifdef DO_ACTIVE_LIST
@@ -464,10 +544,15 @@ float	drawships(float  in_elapsed_since_last_call,                // nst0022
     /* We're potentially called multiple times per frame:
      * reflections ("sim/graphics/view/world_render_type" == 1), multiple shadows (== 3) and finally normal (== 0).
      * So skip calculations if we've already run the calculations for this frame. */
-    if ((now = XPLMGetDataf(ref_monotonic)) != last_frame)
+
+    // nst0022 "frame": that is not true, coding is not frame-related, but related to elapsed simulation time
+    //         so, the coding does not recalculate more than once in a second
+    //         we do not need that, because we are called for every frame via flightloop, so always drawupdate()
+
+    //if ((now = XPLMGetDataf(ref_monotonic)) != last_frame)
     {
         drawupdate();
-        last_frame = now;
+      //last_frame = now;
 #ifdef DO_ACTIVE_LIST
         drawtime = 0;
 #endif
@@ -487,32 +572,52 @@ float	drawships(float  in_elapsed_since_last_call,                // nst0022
     //    do_wakes = 1;			/* Do wakes on base pass if reflections enabled */
     //}
     //else				/* shadows or base */
-    //{
+    {
         for (a=active_routes; a; a=a->next)
             if (*a->object_ref && indrawrange(a->drawinfo.x - view_x, a->drawinfo.z - view_z))
             {
                 //XPLMDrawObjects(*a->object_ref, 1, &(a->drawinfo), is_night, 1); // nst0022
-                XPLMInstanceSetPosition(a->instance_ref, &(a->drawinfo), &dummy);  // nst0022
+                XPLMInstanceSetPosition(a->instance_ref_ship, &(a->drawinfo), &dummy);  // nst0022
 
-                // nst0022 & JT8D-17 begin
-                /* Pick wake size */
-                XPLMInstanceRef instance_ref_wake;
-                if      (a->ship->semilen >= WAKE_BIG) {instance_ref_wake = instance_ref_wake_big;}
-                else if (a->ship->semilen >= WAKE_MED) {instance_ref_wake = instance_ref_wake_med;}
-                else                                   {instance_ref_wake = instance_ref_wake_sml;}
-                // wakes
-                if ((a->ship->speed >= WAKE_MINSPEED)                             &&	// only show wakes for ships going at speed
-                    (a->last_node + a->direction >= 0)                            &&  // and going forward
-                    (a->last_node + a->direction < a->route->pathlen))          //&&	// and not lingering
-                    //inwakerange(a->drawinfo.x - view_x, a->drawinfo.z - view_z))			// and closeish
+                int in_wakerange = inwakerange(a->drawinfo.x - view_x, a->drawinfo.z - view_z);
+
+                // nst0022 2.2 begin
+
+                int is_lingering = 0;
+
+                if ((((a->last_node + 1) == a->route->pathlen) && (a->direction ==  1))  || // at end   of route
+                    (( a->last_node      == 0                ) && (a->direction == -1)))    // at start of route
                 {
-					a->drawinfo.z = a->drawinfo.z + 5; // Raise wake a bit to alleviate clipping
-					XPLMInstanceSetPosition(instance_ref_wake, &(a->drawinfo), &dummy); // draw wake regularly
-                } else {
-					a->drawinfo.z = - 5; // Hide wake below sea level
-					XPLMInstanceSetPosition(instance_ref_wake, &(a->drawinfo), &dummy); // hide wake
-				}
-                // nst0022 & JT8D-17 end
+                  is_lingering = 1;
+                }
+
+                // wakes
+                if (in_wakerange)  // only show wakes for ships that are close enough
+                {
+                  if (a->ship->speed >= WAKE_MINSPEED)            // only show wakes for ships going at speed
+                  {
+                    if (is_lingering == 0)
+                    {
+                      a->drawinfo.y += 0.40f; // workaroud: raise wake 40 cm (medium value, varies from ship to ship)
+                      XPLMInstanceSetPosition(a->instance_ref_wake, &(a->drawinfo), &dummy);
+                      a->drawinfo.y -= 0.40f; // restore old value, just in case
+
+                      a->set_pos_once_wake = 0;
+                    }
+                    else
+                    {
+                      if (a->set_pos_once_wake == 0)
+                      {
+                        a->set_pos_once_wake = 1;
+
+                        a->drawinfo.y -= 1.0f; // lower wake below water level, we do not want to see it
+                        XPLMInstanceSetPosition(a->instance_ref_wake, &(a->drawinfo), &dummy);
+                        a->drawinfo.y += 1.0f; // restore old value, just in case
+                      }
+                    }
+                  }
+                }
+                // nst0022 2.2 end
             }
 
         // nst0022 begin
@@ -530,12 +635,12 @@ float	drawships(float  in_elapsed_since_last_call,                // nst0022
         //            (a->last_node+a->direction >= 0) && (a->last_node+a->direction < a->route->pathlen) &&	/* and not lingering */
         //            inwakerange(a->drawinfo.x - view_x, a->drawinfo.z - view_z))				/* and closeish */
         //        {
-        //            XPLMDrawObjects(a->ship->semilen >= WAKE_BIG ? wake_big_ref : (a->ship->semilen >= WAKE_MED ? wake_med_ref : wake_sml_ref), 1, &(a->drawinfo), 0, 1);
+        //            XPLMDrawObjects(a->ship->semilen >= WAKE_BIG ? wake_ref_big : (a->ship->semilen >= WAKE_MED ? wake_ref_med : wake_ref_sml), 1, &(a->drawinfo), 0, 1);
         //        }
         //    glDisable(GL_POLYGON_OFFSET_FILL);
         // nst0022 end
         //}
-    //}
+    }
 
 #ifdef DO_ACTIVE_LIST
 # if IBM
@@ -546,94 +651,11 @@ float	drawships(float  in_elapsed_since_last_call,                // nst0022
     drawtime += (t2.tv_sec-t1.tv_sec) * 1000000 + t2.tv_usec - t1.tv_usec;
 # endif
     if (drawtime>drawmax) { drawmax=drawtime; }
-    if (!render_pass) { last_frame = 0; }	/* In DEBUG recalculate while paused for easier debugging / profiling */
+    //if (!render_pass) { last_frame = 0; }	/* In DEBUG recalculate while paused for easier debugging / profiling */
 #endif
 //  return 1; // nst0022
 	return -1.0; // -1.0 executes every 1 frame
 }
-
-
-// nst0022 begin
-//#ifdef DO_LOCAL_MAP
-///* Work out screen locations in local map */
-//static int drawmap3d(XPLMDrawingPhase inPhase, int inIsBefore, void *inRefcon)
-//{
-//    route_list_t *route_list;
-//    int i, j;
-//
-//    if (!do_local_map) { return 1; }
-//
-//    if (active_n)
-//    {
-//        GLdouble model[16], proj[16], winX, winY, winZ;
-//        GLint view[4];
-//        active_route_t *a;
-//
-//        /* This is slow, but it's only the local map */
-//        glGetDoublev(GL_MODELVIEW_MATRIX, model);
-//        glGetDoublev(GL_PROJECTION_MATRIX, proj);
-//        glGetIntegerv(GL_VIEWPORT, view);
-//
-//        a=active_routes;
-//        while (a!=NULL)
-//        {
-//            gluProject(a->drawinfo.x, a->drawinfo.y, a->drawinfo.z, model, proj, view, &winX, &winY, &winZ);
-//            a->mapx=winX;
-//            a->mapy=winY;
-//            a=a->next;
-//        }
-//    }
-//
-//    XPLMSetGraphicsState(0, 0, 0,   0, 0,   0, 0);
-//    glColor3f(0,0,0.25);
-//    for (i=current_tile.south-TILE_RANGE; i<=current_tile.south+TILE_RANGE; i++)
-//        for (j=current_tile.west-TILE_RANGE; j<=current_tile.west+TILE_RANGE; j++)
-//        {
-//            route_list=getroutesbytile(i,j);
-//            while (route_list)
-//            {
-//                route_t *route=route_list->route;
-//                int k;
-//
-//                glBegin(GL_LINE_STRIP);
-//                for (k=0; k<route->pathlen; k++)
-//                {
-//                    double x, y, z;
-//                    XPLMWorldToLocal(route->path[k].lat, route->path[k].lon, 0.0, &x, &y, &z);
-//                    glVertex3f(x,y,z);
-//                }
-//                glEnd();
-//                route_list=route_list->next;
-//            }
-//        }
-//
-//    return 1;
-//}
-//
-//
-///* Draw ship icons in local map */
-//static int drawmap2d(XPLMDrawingPhase inPhase, int inIsBefore, void *inRefcon)
-//{
-//    int width, height;
-//    active_route_t *a;
-//    float color[] = { 0, 0, 0.25 };
-//
-//    if (!do_local_map) { return 1; }
-//
-//    XPGetElementDefaultDimensions(xpElement_CustomObject, &width, &height, NULL);
-//
-//    a=active_routes;
-//    while (a!=NULL)
-//    {
-//        XPLMDrawString(color, a->mapx+6, a->mapy-3, a->route->name, NULL, xplmFont_Proportional);
-//        XPDrawElement(a->mapx-width/2, a->mapy-height+height/2, a->mapx+width-width/2, a->mapy+height/2, xpElement_CustomObject, 0);
-//        a=a->next;
-//    }
-//
-//    return 1;
-//}
-//#endif	/* DO_LOCAL_MAP */
-// nst0022 end
 
 
 #ifdef DO_ACTIVE_LIST
@@ -688,31 +710,120 @@ static void drawdebug(XPLMWindowID inWindowID, void *inRefcon)
 }
 #endif	/* DO_ACTIVE_LIST */
 
+//---------
+// function
+//---------
 
-// nst0022 begin
-//static void menuhandler(void *inMenuRef, void *inItemRef)
-//{
-//    switch ((intptr_t) inItemRef)
-//    {
-//#ifdef DO_LOCAL_MAP
-//    case menu_idx_local_map:
-//        do_local_map=!do_local_map;
-//        XPLMCheckMenuItem(my_menu_id, menu_idx_local_map, do_local_map ? xplm_Menu_Checked : xplm_Menu_Unchecked);
-//        if (do_local_map)
-//        {
-//            XPLMRegisterDrawCallback(drawmap3d, xplm_Phase_LocalMap3D, 0, NULL);
-//            XPLMRegisterDrawCallback(drawmap2d, xplm_Phase_LocalMap2D, 0, NULL);
-//        }
-//        else
-//        {
-//            XPLMUnregisterDrawCallback(drawmap3d, xplm_Phase_LocalMap3D, 0, NULL);
-//            XPLMUnregisterDrawCallback(drawmap2d, xplm_Phase_LocalMap2D, 0, NULL);
-//        }
-//        break;
-//#endif
-//    }
-//}
-// nst0022 end
+// nst0022 2.1 begin
+static void menuhandler(void * inMenuRef,
+                        void * inItemRef)
+{
+
+  switch ((intptr_t) inItemRef)
+  {
+    case menu_index_item1: toggle_menu_item(menu_index_item1, &check1); break;
+    case menu_index_item2: toggle_menu_item(menu_index_item2, &check2); break;
+    case menu_index_item3: toggle_menu_item(menu_index_item3, &check3); break;
+  }
+}
+
+//---------
+// function
+//---------
+
+static void toggle_menu_item( menu_index_t    menu_index_itemx,
+                              XPLMMenuCheck * check)
+{
+  XPLMMenuCheck tmpCheck = xplm_Menu_NoCheck;
+
+  XPLMCheckMenuItemState(my_menu_id, menu_index_itemx, &tmpCheck);
+
+  tmpCheck = (tmpCheck == xplm_Menu_Checked) ? xplm_Menu_Unchecked : xplm_Menu_Checked;
+
+  * check = tmpCheck;
+
+  XPLMCheckMenuItem(my_menu_id, menu_index_itemx, tmpCheck);
+}
+
+//---------
+// function
+//---------
+
+static void put_prefs()
+{
+  XPLMMenuCheck check1 = xplm_Menu_NoCheck;
+  XPLMMenuCheck check2 = xplm_Menu_NoCheck;
+  XPLMMenuCheck check3 = xplm_Menu_NoCheck;
+
+  XPLMCheckMenuItemState(my_menu_id, menu_index_item1, &check1);
+  XPLMCheckMenuItemState(my_menu_id, menu_index_item2, &check2);
+  XPLMCheckMenuItemState(my_menu_id, menu_index_item3, &check3);
+
+  if ((check1 == check1_old)  &&
+      (check2 == check2_old)  &&
+      (check3 == check3_old))
+  {
+    return;
+  }
+
+  char path[222];
+  strcpy(path, strdup(relpath));
+
+  strcat(path, "/prefs");
+
+  FILE * fh = fopen(path, "w");
+
+  char text[9];
+
+  sprintf(text, "%d%d%d", (int)check1, (int)check2, (int)check3);
+
+  fprintf(fh, "%s", text);
+
+  fclose(fh);
+}
+
+//---------
+// function
+//---------
+
+static void get_prefs()
+{
+  check1 = xplm_Menu_Checked;
+  check2 = xplm_Menu_Checked;
+  check3 = xplm_Menu_Checked;
+
+  char path[222];
+  strcpy(path, strdup(relpath));
+
+  strcat(path, "/prefs");
+
+  FILE * fh = fopen(path, "r");
+
+  if (fh != NULL)
+  {
+    char text[9];
+
+    sprintf(text, "%d%d%d", (int)check1, (int)check2, (int)check3);
+
+    if (fgets(text, sizeof(text), fh) != NULL)
+    {
+      check1 = (XPLMMenuCheck)(text[0] & 0x0f);
+      check2 = (XPLMMenuCheck)(text[1] & 0x0f);
+      check3 = (XPLMMenuCheck)(text[2] & 0x0f);
+    }
+
+    fclose(fh);
+  }
+
+  XPLMCheckMenuItem(my_menu_id, menu_index_item1, check1);
+  XPLMCheckMenuItem(my_menu_id, menu_index_item2, check2);
+  XPLMCheckMenuItem(my_menu_id, menu_index_item3, check3);
+
+  check1_old = check1;
+  check2_old = check2;
+  check3_old = check3;
+}
+// nst0022 2.1 end
 
 
 #ifdef DEBUG
@@ -764,9 +875,9 @@ PLUGIN_API int XPluginStart(char *outName, char *outSignature, char *outDescript
 {
     char buffer[PATH_MAX], *c;
 
-    sprintf(outName, "SeaTraffic v%.2f", VERSION);
+    sprintf(outName, "SeaTraffic v%.1f", VERSION);
     strcpy(outSignature, "Marginal.SeaTraffic");
-    strcpy(outDescription, "Animated marine traffic by Marginal. Updated for X-Plane 11.50+.");
+    strcpy(outDescription, "Animated marine traffic. By Marginal, updated for XP 11.50+ by nst0022");
 
 #ifdef DEBUG
     XPLMSetErrorCallback(mybad);
@@ -791,25 +902,15 @@ PLUGIN_API int XPluginStart(char *outName, char *outSignature, char *outDescript
 
     strcpy(buffer, relpath);
     strcat(buffer, "wake_big.obj");
-    if (!(wake_big_ref=loadobject(buffer))) { return 0; }
-    else // nst0022
-    {
-      instance_ref_wake_big = XPLMCreateInstance(wake_big_ref, drefs);
-    }
+    if (!(wake_ref_big=loadobject(buffer))) { return 0; }
+
     strcpy(buffer, relpath);
     strcat(buffer, "wake_med.obj");
-    if (!(wake_med_ref=loadobject(buffer))) { return 0; }
-    else // nst0022
-    {
-      instance_ref_wake_med = XPLMCreateInstance(wake_med_ref, drefs);
-    }
+    if (!(wake_ref_med=loadobject(buffer))) { return 0; }
+
     strcpy(buffer, relpath);
     strcat(buffer, "wake_sml.obj");
-    if (!(wake_sml_ref=loadobject(buffer))) { return 0; }
-    else // nst0022
-    {
-      instance_ref_wake_sml = XPLMCreateInstance(wake_sml_ref, drefs);
-    }
+    if (!(wake_ref_sml=loadobject(buffer))) { return 0; }
 
     if (!readroutes(mypath, outDescription)) { return failinit(outDescription); }	/* read routes.txt */
 
@@ -845,22 +946,55 @@ PLUGIN_API void XPluginStop(void)
 #ifdef DO_ACTIVE_LIST
     if (windowId) { XPLMDestroyWindow(windowId); }
 #endif
+
+  // nst0022 2.1 begin
+
+	// clean up our map layer:
+  //    if we created it, we should be good citizens and destroy it before the plugin is unloaded
+
+	if (g_layer)
+	{
+		// triggers the will-be-deleted callback of the layer, causing g_layer to get set back to NULL
+
+		XPLMDestroyMapLayer(g_layer);
+	}
+
+  // nst0022 2.1 end
 }
 
 PLUGIN_API int XPluginEnable(void)  // nst0022
 {
+  // nst0022 2.1 begin
+
+	// we want to create our layer in the standard map used in the UI (not other maps like the IOS)
+	// if the map already exists in X-Plane (i.e., if the user has opened it), we can create our layer immediately
+	// otherwise, though, we need to wait for the map to be created, and only *then* can we create our layers
+
+	if (XPLMMapExists(XPLM_MAP_USER_INTERFACE))
+	{
+		create_our_map_layer(XPLM_MAP_USER_INTERFACE, NULL);
+	}
+
+	// listen for any new map objects, that get created
+
+	XPLMRegisterMapCreationHook(&create_our_map_layer, NULL);
+
+  // nst0022 2.1 end
+
   return 1;                         // nst0022
 }
 
 PLUGIN_API void XPluginDisable(void)
 {
+  // put preferences nst0022 2.1
+  put_prefs();
 }
 
 PLUGIN_API void XPluginReceiveMessage(XPLMPluginID inFrom, long inMessage, void *inParam)
 {
     if (!done_init)
     {
-        //int my_menu_index; // nst0022
+        int my_menu_index; // nst0022 2.1
         done_init = 1;
 
         /* Load default ship .objs. Deferred to here so scenery library has been scanned */
@@ -868,38 +1002,250 @@ PLUGIN_API void XPluginReceiveMessage(XPLMPluginID inFrom, long inMessage, void 
             return;	/* Exit before setting up menus & callbacks */
 
         /* Finish setup */
-        ref_renopt = XPLMFindDataRef("sim/private/controls/reno/draw_objs_06");	/* v10+ */
+        //ref_renopt = XPLMFindDataRef("sim/private/controls/reno/draw_objs_06");	/* v10+ */ // nst0022 2.3
         XPLMEnableFeature("XPLM_WANTS_REFLECTIONS", 1);
         //XPLMRegisterDrawCallback(drawships, xplm_Phase_Objects, 1, NULL);		/* Before other 3D objects */ // nst0022
         XPLMRegisterFlightLoopCallback(drawships,                                                           // nst0022
                                        0.1,		// interval
                                        NULL);	// refcon not used
-        // nst0022 begin
-//        my_menu_index = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "SeaTraffic", NULL, 1);
-//        my_menu_id = XPLMCreateMenu("SeaTraffic", XPLMFindPluginsMenu(), my_menu_index, menuhandler, NULL);
-//        /* Menu items must be added in order of menu_idx enum */
-//#ifdef DO_LOCAL_MAP
-//        /* Setup local map */
-//        XPLMAppendMenuItem(my_menu_id, "Draw routes in Local Map", (void*) menu_idx_local_map, 0);
-//        XPLMCheckMenuItem(my_menu_id, menu_idx_local_map, do_local_map ? xplm_Menu_Checked : xplm_Menu_Unchecked);
-//        if (do_local_map)
-//        {
-//            XPLMRegisterDrawCallback(drawmap3d, xplm_Phase_LocalMap3D, 0, NULL);
-//            XPLMRegisterDrawCallback(drawmap2d, xplm_Phase_LocalMap2D, 0, NULL);
-//        }
-//#endif
-        // nst0022 end
+        // nst0022 2.1 begin
+        my_menu_index = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "SeaTraffic", NULL, 1);
+        my_menu_id    = XPLMCreateMenu("SeaTraffic", XPLMFindPluginsMenu(), my_menu_index, menuhandler, NULL);
+        // menu items must be added in order of menu_idx enum
+        XPLMAppendMenuItem(my_menu_id, "Map: draw routes", (void *) menu_index_item1, 0);
+        XPLMAppendMenuItem(my_menu_id, "Map: draw icons" , (void *) menu_index_item2, 0);
+        XPLMAppendMenuItem(my_menu_id, "Map: draw labels", (void *) menu_index_item3, 0);
+        get_prefs();
+        // nst0022 2.1 end
         need_recalc = 1;
     }
 
-    if (ref_renopt)		/* change to rendering options causes SCENERY_LOADED */
-    {
-        int new_active_max = XPLMGetDatai(ref_renopt) * RENDERING_SCALE;
-        if (new_active_max > ACTIVE_MAX) { new_active_max = ACTIVE_MAX; }
-        if (active_max != new_active_max)
-        {
-            active_max = new_active_max;
-            need_recalc = 1;
-        }
-    }
+    //if (ref_renopt)		/* change to rendering options causes SCENERY_LOADED */ // nst0022 2.3
+    //{
+    //    int new_active_max = XPLMGetDatai(ref_renopt) * RENDERING_SCALE;
+    //    if (new_active_max > ACTIVE_MAX) { new_active_max = ACTIVE_MAX; }
+    //    if (active_max != new_active_max)
+    //    {
+    //        active_max = new_active_max;
+    //        need_recalc = 1;
+    //    }
+    //}
 }
+
+//---------
+// function nst0022 2.1
+//---------
+
+void create_our_map_layer(const char  * mapIdentifier,
+                          void        * refcon)
+{
+	if (!g_layer &&                                       // confirm we have not created our markings layer yet
+                                                        // (e.g., as a result of a previous callback), or, if we did,
+                                                        // it is been destroyed
+			!strcmp(mapIdentifier, XPLM_MAP_USER_INTERFACE))  // we only want to create a layer in the normal user interface map (not the IOS)
+	{
+		XPLMCreateMapLayer_t params;
+
+		params.structSize             = sizeof(XPLMCreateMapLayer_t);
+		params.mapToCreateLayerIn     = XPLM_MAP_USER_INTERFACE;
+		params.willBeDeletedCallback  = &will_be_deleted;
+		params.prepCacheCallback      = &prep_cache;
+		params.showUiToggle           = 1;                      // 1 = "SeaTraffic" appears in map window, is initially always checked
+		params.refcon                 = NULL;
+		params.layerType              = xplm_MapLayer_Markings;
+		params.drawCallback           = &draw_markings;
+		params.iconCallback           = &draw_marking_icons;
+		params.labelCallback          = &draw_marking_labels;
+		params.layerName              = "SeaTraffic";
+
+		// note:  this could fail (return NULL), if we had not already confirmed,
+    //        that params.mapToCreateLayerIn exists in X-Plane already
+
+		g_layer = XPLMCreateMapLayer(&params);
+	}
+}
+
+//---------
+// function nst0022 2.1
+//---------
+
+void prep_cache(XPLMMapLayerID        layerID,
+                const float         * inTotalMapBoundsLeftTopRightBottom,
+                XPLMMapProjectionID   projectionID,
+                void                * inRefcon)
+{
+	// because the map uses true cartographical projections, the size of 1 meter in map units can change
+	// depending on where you are asking about
+  // we ask about the midpoint of the available bounds and assume
+  // the answer will not change too terribly much over the size of the maps shown in the UI
+
+	const float midpoint_x = (inTotalMapBoundsLeftTopRightBottom[0] + inTotalMapBoundsLeftTopRightBottom[2]) / 2;
+	const float midpoint_y = (inTotalMapBoundsLeftTopRightBottom[1] + inTotalMapBoundsLeftTopRightBottom[3]) / 2;
+
+  // we draw our icons to be 1000 meters wide in the map
+
+	s_icon_width = XPLMMapScaleMeter(projectionID, midpoint_x, midpoint_y) * 1000;
+}
+
+//---------
+// function nst0022 2.1
+//---------
+
+void will_be_deleted( XPLMMapLayerID    layerID,
+                      void            * inRefcon)
+{
+	if (layerID == g_layer)
+  {
+		g_layer = NULL;
+  }
+}
+
+//---------
+// function nst0022 2.1
+//---------
+
+void draw_markings( XPLMMapLayerID        layerID,
+                    const float         * inMapBoundsLeftTopRightBottom,
+                    float                 zoomRatio,
+                    float                 mapUnitsPerUserInterfaceUnit,
+                    XPLMMapStyle          mapStyle,
+                    XPLMMapProjectionID   projectionID,
+                    void                * inRefcon)
+{
+  if (check1 != xplm_Menu_Checked)
+  {
+    return;
+  }
+
+  // nst022 2.3
+  active_route_t  * a = active_routes; // first of active routes
+  float             x,
+                    y;
+
+  //---------------
+  // draw the lines
+  //---------------
+
+	// the arbitrary OpenGL drawing done for our markings layer
+
+	XPLMSetGraphicsState(0, // no fog
+		                   0, // 0 texture units
+		                   0, // no lighting
+		                   0, // no alpha testing
+		                   1, // do alpha blend
+		                   1, // do depth testing
+		                   0  // no depth writingx
+	);
+
+	glColor3f(0.2, 0.5, 0.8); // blueish line color
+  glLineWidth(2);           // same as xplane's flight paths
+  // begin anti-aliasing
+  glEnable    (GL_LINE_SMOOTH                       );
+  glEnable    (GL_POLYGON_SMOOTH                    );
+  glHint      (GL_LINE_SMOOTH_HINT   , GL_NICEST    );
+  glHint      (GL_POLYGON_SMOOTH_HINT, GL_NICEST    );
+  glEnable    (GL_BLEND                             );
+  glBlendFunc (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+  // end anti-aliasing
+
+  //glLineStipple(1, 0xc6c6);   // define dashed line: 16 "pixels", 4 x (2 on, 2 off)
+  //glEnable(GL_LINE_STIPPLE);  // use dashed line
+
+  // nst022 2.3
+  while (a != NULL)
+  {
+    glBegin(GL_LINE_STRIP);
+
+    for (int k = 0; k < a->route->pathlen; k++)
+    {
+		  XPLMMapProject(projectionID, a->route->path[k].lat, a->route->path[k].lon, &x, &y);
+
+      glVertex3f(x, y, 0.0f);
+    }
+
+    glEnd();
+
+    a = a->next;
+  }
+}
+
+//---------
+// function nst0022 2.1
+//---------
+
+void draw_marking_icons(XPLMMapLayerID        layerID,
+                        const float         * inMapBoundsLeftTopRightBottom,
+                        float                 zoomRatio,
+                        float                 mapUnitsPerUserInterfaceUnit,
+                        XPLMMapStyle          mapStyle,
+                        XPLMMapProjectionID   projectionID,
+                        void                * inRefcon)
+{
+  if (check2 != xplm_Menu_Checked)
+  {
+    return;
+  }
+
+  active_route_t  * a = active_routes;
+	float             x,
+                    y;
+
+  while (a != NULL)
+  {
+		XPLMMapProject(projectionID, a->loc.lat, a->loc.lon, &x, &y);
+
+    XPLMDrawMapIconFromSheet( layerID,
+                              default_icon_library[a->route->ship_kind].name,
+                              0, 0,                     // draw the image cell at (s, t) == (0, 0)
+                                                        //    (i.e., the bottom left cell in the image)
+                              1, 1,                     // our sample image is one image cell wide, and one image cell tall
+                              x,
+                              y,
+                              xplm_MapOrientation_Map,  // orient the icon relative to the map itself, rather than relative to the UI
+                              0,                        // zero degrees rotation
+                              s_icon_width);
+    a = a->next;
+  }
+}
+
+//---------
+// function nst0022 2.1
+//---------
+
+void draw_marking_labels( XPLMMapLayerID        layerID,
+                          const float         * inMapBoundsLeftTopRightBottom,
+                          float                 zoomRatio,
+                          float                 mapUnitsPerUserInterfaceUnit,
+                          XPLMMapStyle          mapStyle,
+                          XPLMMapProjectionID   projectionID,
+                          void                * inRefcon)
+{
+  if (check3 != xplm_Menu_Checked)
+  {
+    return;
+  }
+
+  // do not label, when zoomed too far out, everything will run together in a big, illegible mess
+	if (zoomRatio >= 18)
+	{
+    active_route_t  * a       = active_routes;
+		float             x,
+                      y;
+		const double      offset_x  = -0.0025;
+
+
+    while (a != NULL)
+    {
+		  XPLMMapProject(projectionID, a->loc.lat + offset_x, a->loc.lon, &x, &y);
+
+      XPLMDrawMapLabel( layerID,
+                        a->route->name,
+                        x,
+                        y,
+                        xplm_MapOrientation_Map,
+                        0);
+      a = a->next;
+    }
+	}
+}
+
